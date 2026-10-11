@@ -29,3 +29,7 @@ Thumbs.db
 # Playwright test artifacts
 playwright-report/
 test-results/
+playwright/.auth/
+
+# Claude Code local worktrees (nested checkouts)
+.claude/worktrees/

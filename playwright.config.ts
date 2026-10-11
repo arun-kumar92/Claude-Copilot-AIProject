@@ -16,6 +16,12 @@ export default defineConfig({
   },
 
   projects: [
-    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+    // Logs in once and saves the session to playwright/.auth/user.json
+    { name: 'setup', testMatch: /.*\.setup\.js/ },
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'], storageState: 'playwright/.auth/user.json' },
+      dependencies: ['setup'],
+    },
   ],
 });

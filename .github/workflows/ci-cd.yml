@@ -1,0 +1,239 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# EventHub – CI/CD Pipeline
+#
+#   ┌────────────────┐
+#   │ backend-checks │──┐
+#   └────────────────┘  │   ┌───────────┐   ┌──────────────────────────────┐
+#                       ├──▶│ e2e-tests │──▶│ deploy (push to main only,   │
+#   ┌─────────────────┐ │   └───────────┘   │ when DEPLOY_ENABLED = true)  │
+#   │ frontend-checks │─┘                   └──────────────────────────────┘
+#   └─────────────────┘
+#
+# TRIGGERS
+#   push to main      → full pipeline (deploy runs only if enabled, see below)
+#   pull_request      → checks + E2E (never deploys)
+#   schedule (daily)  → checks + E2E against the live site, to catch site changes
+#   workflow_dispatch → manual run from the Actions tab
+#
+# E2E TESTS
+#   Run against the site in playwright.config.ts (use.baseURL). The 'setup'
+#   project logs in once and shares the session with the specs.
+#   All runs share one test account, so E2E jobs are serialised (concurrency
+#   group below) to stop two runs clearing each other's bookings.
+#
+# DEPLOY (optional; skipped until you set it up)
+#   Repo Settings → Secrets and variables → Actions:
+#     Variables: DEPLOY_ENABLED = true, APP_URL = https://your-site
+#     Secrets:   SERVER_HOST, SERVER_USER, SERVER_SSH_KEY, BACKEND_ENV, FRONTEND_ENV
+#   The server must already have the repo cloned at DEPLOY_PATH, with PM2
+#   running the backend and frontend. Prisma migrations are NOT run here; apply
+#   them by hand (`npx prisma migrate deploy`) before a release with schema changes.
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '30 2 * * *'   # daily 02:30 UTC
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch/PR (deploy has its own non-cancelling group)
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '20'
+  DEPLOY_PATH: /home/ubuntu/eventhub
+
+jobs:
+
+  # ── 1. Backend checks: syntax + Prisma schema (no database needed) ──────────
+  backend-checks:
+    name: Backend Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      # Placeholder so Prisma can parse the schema; nothing connects to it
+      DATABASE_URL: mysql://ci:ci@localhost:3306/ci_placeholder
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: JavaScript syntax check
+        run: |
+          node --check server.js
+          node --check app.js
+
+      - name: Prisma validate
+        run: npx prisma validate
+
+      - name: Prisma format check
+        run: |
+          npx prisma format
+          if ! git diff --exit-code -- prisma/schema.prisma; then
+            echo "::error file=backend/prisma/schema.prisma::Schema is not formatted. Run 'cd backend && npx prisma format' and commit."
+            exit 1
+          fi
+
+      - name: Prisma generate
+        run: npx prisma generate
+
+  # ── 2. Frontend checks: type-check + production build ───────────────────────
+  frontend-checks:
+    name: Frontend Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript type check
+        run: npx tsc --noEmit
+
+      - name: Production build
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+          NEXT_PUBLIC_API_URL: http://localhost:3001/api   # build-time placeholder
+
+  # ── 3. Playwright E2E tests ─────────────────────────────────────────────────
+  e2e-tests:
+    name: Playwright E2E Tests
+    runs-on: ubuntu-latest
+    needs: [backend-checks, frontend-checks]
+    timeout-minutes: 30
+    # One E2E run at a time across the whole repo: all runs share one test account
+    concurrency:
+      group: e2e-shared-test-account
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium --with-deps
+
+      # One retry absorbs live-site blips; a test that fails twice fails the job
+      - name: Run Playwright tests
+        run: npx playwright test --reporter=html,line,github --retries=1
+
+      - name: Upload HTML report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ github.run_id }}
+          path: playwright-report/
+          retention-days: 30
+
+      - name: Upload traces, screenshots and videos
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.run_id }}
+          path: test-results/
+          retention-days: 7
+
+  # ── 4. Deploy (push to main only, opt-in) ───────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: e2e-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    timeout-minutes: 20
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false   # never abort a deploy half-way
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+
+      - name: Write .env files on server
+        env:
+          SSH_TARGET: ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}
+          BACKEND_ENV: ${{ secrets.BACKEND_ENV }}
+          FRONTEND_ENV: ${{ secrets.FRONTEND_ENV }}
+        run: |
+          printf '%s' "$BACKEND_ENV"  | ssh -i ~/.ssh/deploy_key -o BatchMode=yes "$SSH_TARGET" "cat > $DEPLOY_PATH/backend/.env"
+          printf '%s' "$FRONTEND_ENV" | ssh -i ~/.ssh/deploy_key -o BatchMode=yes "$SSH_TARGET" "cat > $DEPLOY_PATH/frontend/.env"
+
+      - name: Pull, build and reload
+        env:
+          SSH_TARGET: ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=30 "$SSH_TARGET" \
+            "DEPLOY_PATH=$DEPLOY_PATH SHA=${{ github.sha }} bash -s" << 'REMOTE_EOF'
+            set -euo pipefail
+            cd "$DEPLOY_PATH"
+            git fetch --all --prune
+            git reset --hard "$SHA"            # deploy exactly the commit that passed CI
+            echo "Deploying $(git rev-parse --short HEAD): $(git log -1 --pretty=%s)"
+
+            cd "$DEPLOY_PATH/backend"
+            npm ci
+            npx prisma generate
+
+            cd "$DEPLOY_PATH/frontend"
+            npm ci
+            NEXT_TELEMETRY_DISABLED=1 npm run build
+
+            pm2 reload all --update-env
+            pm2 save
+          REMOTE_EOF
+
+      - name: Smoke check
+        if: ${{ vars.APP_URL != '' }}
+        run: curl --fail --silent --show-error --max-time 30 --retry 5 --retry-delay 5 "${{ vars.APP_URL }}" > /dev/null
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "### ✅ Deployed \`${GITHUB_SHA::7}\` to production" >> "$GITHUB_STEP_SUMMARY"
+          echo "Triggered by @${{ github.actor }}" >> "$GITHUB_STEP_SUMMARY"
