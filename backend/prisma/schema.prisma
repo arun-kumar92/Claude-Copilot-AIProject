@@ -9,6 +9,7 @@ datasource db {
   provider = "mysql"
   url      = env("DATABASE_URL")
 }
+
 //comment
 model User {
   id        Int       @id @default(autoincrement())
